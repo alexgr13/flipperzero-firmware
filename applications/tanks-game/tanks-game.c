@@ -1,4 +1,5 @@
 #include <furi.h>
+#include <furi-hal.h>
 #include <gui/gui.h>
 #include <input/input.h>
 #include <stdlib.h>
@@ -51,6 +52,47 @@ typedef struct {
     uint8_t respawn_cooldown;
 } PlayerState;
 
+#define note_stack_size 4
+
+typedef enum {
+    // Delay
+    N = 0,
+    // Octave 4
+    B4 = 494,
+    // Octave 5
+    C5 = 523,
+    D5 = 587,
+    D_5 = 622,
+    E5 = 659,
+    F5 = 698,
+    F_5 = 740,
+    G5 = 784,
+    G_5 = 830,
+    A5 = 880,
+    A_5 = 932,
+    B5 = 988,
+    // Octave 6
+    C6 = 1046,
+    D6 = 1175,
+    E6 = 1319,
+} MelodyEventNote;
+
+typedef enum {
+    L1 = 1,
+    L2 = 2,
+    L4 = 4,
+    L8 = 8,
+    L16 = 16,
+    L32 = 32,
+    L64 = 64,
+    L128 = 128,
+} MelodyEventLength;
+
+typedef struct {
+    MelodyEventNote note;
+    MelodyEventLength length;
+} MelodyEventRecord;
+
 typedef struct {
     // char map[FIELD_WIDTH][FIELD_HEIGHT];
     char map[16][11];
@@ -65,17 +107,58 @@ typedef struct {
     uint8_t enemies_respawn_cooldown;
     PlayerState *p1;
     PlayerState *p2;
+
+    // music
+    const MelodyEventRecord* note_record;
+    const MelodyEventRecord* note_stack[note_stack_size];
+    uint8_t volume_id;
+    uint8_t volume_id_max;
 } TanksState;
 
 typedef enum {
     EventTypeTick,
     EventTypeKey,
+    EventTypeNote,
 } EventType;
 
 typedef struct {
     EventType type;
     InputEvent input;
 } TanksEvent;
+
+typedef struct {
+    // describe state here
+    const MelodyEventRecord* note_record;
+    const MelodyEventRecord* note_stack[note_stack_size];
+    uint8_t volume_id;
+    uint8_t volume_id_max;
+} State;
+
+typedef struct {
+    union {
+        InputEvent input;
+        const MelodyEventRecord* note_record;
+    } value;
+    EventType type;
+} MusicDemoEvent;
+
+typedef struct {
+    ValueMutex* state_mutex;
+    osMessageQueueId_t event_queue;
+
+} MusicDemoContext;
+
+const MelodyEventRecord tank_melody[] = {
+    {C5, L8}, {D5, L8}, {D_5, L8}, {C5, L8}, {D5, L8}, {D_5, L8},
+    {D_5, L8}, {F5, L8}, {G5, L8}, {D_5, L8}, {F5, L8}, {G5, L8},
+    {F5, L8}, {G5, L8}, {A5, L8}, {F5, L8}, {G5, L8}, {A5, L8},
+    {G_5, L8}, {A_5, L8}, {C6, L8}, {G_5, L8}, {A_5, L8}, {C6, L8},
+    {C6, L8}, {N, L4}, {C6, L8}, {C6, L8}, {C6, L8}, {C6, L8}
+};
+
+float tank_volumes[] = {0, 0.02, 0.05, 0.1, 0.5};
+
+bool play_music = false;
 
 static void tanks_game_render_callback(Canvas* const canvas, void* ctx) {
     const TanksState* tanks_state = acquire_mutex((ValueMutex*)ctx, 25);
@@ -666,6 +749,43 @@ static void tanks_game_process_game_step(TanksState* const tanks_state) {
     tanks_state->p1->shooting = false;
 }
 
+void tank_process_note(
+    const MelodyEventRecord* note_record,
+    float bar_length_ms,
+    MusicDemoContext* context) {
+    MusicDemoEvent event;
+    // send note event
+    event.type = EventTypeNote;
+    event.value.note_record = note_record;
+    osMessageQueuePut(context->event_queue, &event, 0, 0);
+
+    // read volume
+    State* state = (State*)acquire_mutex(context->state_mutex, 25);
+    float volume = tank_volumes[state->volume_id];
+    release_mutex(context->state_mutex, state);
+
+    // play note
+    float note_delay = bar_length_ms / (float)note_record->length;
+    if(note_record->note != N) {
+        hal_pwm_set(volume, note_record->note, &SPEAKER_TIM, SPEAKER_CH);
+    }
+    delay(note_delay);
+    hal_pwm_stop(&SPEAKER_TIM, SPEAKER_CH);
+}
+
+void tank_music_player_thread(void* p) {
+    MusicDemoContext* context = (MusicDemoContext*)p;
+
+    const float bpm = 130.0f;
+    // 4/4
+    const float bar_length_ms = (60.0f * 1000.0f / bpm) * 4;
+    const uint16_t melody_start_events_count = sizeof(tank_melody) / sizeof(tank_melody[0]);
+
+    for(size_t i = 0; i < melody_start_events_count; i++) {
+        tank_process_note(&tank_melody[i], bar_length_ms, context);
+    }
+}
+
 int32_t tanks_game_app(void* p) {
     srand(DWT->CYCCNT);
 
@@ -673,6 +793,13 @@ int32_t tanks_game_app(void* p) {
 
     TanksState* tanks_state = furi_alloc(sizeof(TanksState));
     tanks_game_init_game(tanks_state);
+
+    tanks_state->note_record = NULL;
+    for(size_t i = 0; i < note_stack_size; i++) {
+        tanks_state->note_stack[i] = NULL;
+    }
+    tanks_state->volume_id = 1;
+    tanks_state->volume_id_max = sizeof(tank_volumes) / sizeof(tank_volumes[0]);
 
     ValueMutex state_mutex;
     if(!init_mutex(&state_mutex, tanks_state, sizeof(TanksState))) {
@@ -692,6 +819,15 @@ int32_t tanks_game_app(void* p) {
     // Open GUI and register view_port
     Gui* gui = furi_record_open("gui");
     gui_add_view_port(gui, view_port, GuiLayerFullscreen);
+
+    osThreadAttr_t player_attr = {.name = "tank_music_player_thread", .stack_size = 512};
+    MusicDemoContext context = {.state_mutex = &state_mutex, .event_queue = event_queue};
+    osThreadId_t player = osThreadNew(tank_music_player_thread, &context, &player_attr);
+
+    if(player == NULL) {
+        printf("cannot create player thread\r\n");
+        return 255;
+    }
 
     TanksEvent event;
     for(bool processing = true; processing;) {
@@ -743,6 +879,7 @@ int32_t tanks_game_app(void* p) {
         release_mutex(&state_mutex, tanks_state);
     }
 
+    osThreadTerminate(player);
     osTimerDelete(timer);
     view_port_enabled_set(view_port, false);
     gui_remove_view_port(gui, view_port);
