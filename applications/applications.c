@@ -44,6 +44,7 @@ extern int32_t vibro_test_app(void* p);
 extern int32_t music_player_app(void* p);
 extern int32_t snake_game_app(void* p);
 extern int32_t tanks_game_app(void* p);
+extern int32_t network_test_app(void* p);
 
 // On system start hooks declaration
 extern void bt_cli_init();
@@ -216,6 +217,10 @@ const FlipperApplication FLIPPER_PLUGINS[] = {
 
 #ifdef APP_TANKS_GAME
     {.app = tanks_game_app, .name = "Tanks Game", .stack_size = 1024, .icon = &A_Plugins_14},
+#endif
+
+#ifdef APP_NETWORK_TEST
+    {.app = network_test_app, .name = "Network Test", .stack_size = 1024, .icon = &A_Plugins_14},
 #endif
 };
 
